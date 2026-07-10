@@ -134,6 +134,50 @@ modifiable avec `--model`.
 - Export ONNX (opset 18) vérifié par comparaison PyTorch/onnxruntime en
   batch > 1.
 
+## Support SVG (`svg_fit.py`)
+
+Vectorisation d'image en **SVG** par **rendu différentiable + distance à
+l'image** (approche « differentiable vector graphics », en PyTorch pur, sans
+diffvg) :
+
+1. une image SVG est paramétrée par N ellipses colorées (centre, rayons,
+   rotation, couleur, opacité) + un fond ;
+2. un **rasteriseur différentiable** rend ces primitives en pixels (couverture
+   douce + compositing source-over), donc les gradients traversent le rendu ;
+3. on **entraîne** les primitives pour **minimiser la distance (MSE)** avec une
+   image cible ;
+4. on exporte un vrai fichier `.svg` (ouvrable dans un navigateur) + un aperçu
+   PNG du rendu.
+
+La cible peut être :
+
+```bash
+# Cible de démonstration synthétique
+python svg_fit.py --shapes 60 --steps 500
+
+# Un fichier image quelconque
+python svg_fit.py --target photo.png --shapes 80 --out out.svg
+
+# Une image produite par le générateur du pipeline (« l'image générée »)
+python svg_fit.py --from-prompt "une photo de chat" --shapes 60
+
+# Un SVG GÉNÉRÉ PAR UN LLM (Claude ou DeepSeek), rasterisé puis appris
+export DEEPSEEK_API_KEY=sk-...
+python svg_fit.py --from-llm-svg "un soleil au-dessus de collines" --provider deepseek
+
+# Un SVG existant comme référence (hors-ligne)
+python svg_fit.py --llm-svg-file dessin.svg --shapes 60
+```
+
+**Entraînement à partir du SVG du LLM + vérification de proximité.** Avec
+`--from-llm-svg`, le LLM produit un document SVG (contraint aux primitives
+simples `rect`/`circle`/`ellipse`/`polygon`/`line` pour rester rasterisable), on
+le rasterise en image cible, on entraîne notre SVG dessus, puis on **vérifie que
+l'image de notre SVG est proche de celle du SVG du LLM** — rapport `MSE` et
+`PSNR` (dB) avec un verdict `PROCHE ✓`. Le rasteriseur utilise `cairosvg` s'il
+est installé (support complet, `path` inclus), sinon un rasteriseur minimal via
+PIL.
+
 ## Limites (honnêtes)
 
 - Les images sont conditionnées sur des captions synthétiques construites à

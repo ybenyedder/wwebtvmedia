@@ -1,6 +1,7 @@
 torch>=2.4
 torchvision>=0.19
 numpy
+pillow
 tqdm
 matplotlib
 onnx
