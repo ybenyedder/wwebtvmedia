@@ -1,0 +1,30 @@
+{"prompt": "écris une fonction qui inverse une chaîne de caractères", "code": "def inverser(s):\n    return s[::-1]"}
+{"prompt": "écris une fonction factorielle récursive", "code": "def factorielle(n):\n    if n <= 1:\n        return 1\n    return n * factorielle(n - 1)"}
+{"prompt": "écris une fonction fibonacci", "code": "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"}
+{"prompt": "écris une fonction qui vérifie si un mot est un palindrome", "code": "def est_palindrome(mot):\n    mot = mot.lower()\n    return mot == mot[::-1]"}
+{"prompt": "écris une fonction qui calcule la somme des nombres pairs d'une liste", "code": "def somme_pairs(nombres):\n    return sum(n for n in nombres if n % 2 == 0)"}
+{"prompt": "écris fizzbuzz de 1 à n", "code": "def fizzbuzz(n):\n    for i in range(1, n + 1):\n        if i % 15 == 0:\n            print(\"FizzBuzz\")\n        elif i % 3 == 0:\n            print(\"Fizz\")\n        elif i % 5 == 0:\n            print(\"Buzz\")\n        else:\n            print(i)"}
+{"prompt": "écris une fonction qui compte les voyelles d'une chaîne", "code": "def compter_voyelles(s):\n    return sum(1 for c in s.lower() if c in \"aeiouy\")"}
+{"prompt": "écris une fonction qui trouve le maximum d'une liste sans utiliser max", "code": "def maximum(nombres):\n    m = nombres[0]\n    for n in nombres[1:]:\n        if n > m:\n            m = n\n    return m"}
+{"prompt": "écris une fonction qui calcule la moyenne d'une liste", "code": "def moyenne(nombres):\n    return sum(nombres) / len(nombres) if nombres else 0.0"}
+{"prompt": "écris une fonction qui supprime les doublons d'une liste en gardant l'ordre", "code": "def sans_doublons(items):\n    vus = set()\n    resultat = []\n    for x in items:\n        if x not in vus:\n            vus.add(x)\n            resultat.append(x)\n    return resultat"}
+{"prompt": "écris une fonction qui inverse un dictionnaire", "code": "def inverser_dict(d):\n    return {v: k for k, v in d.items()}"}
+{"prompt": "écris une fonction qui teste si un nombre est premier", "code": "def est_premier(n):\n    if n < 2:\n        return False\n    for i in range(2, int(n ** 0.5) + 1):\n        if n % i == 0:\n            return False\n    return True"}
+{"prompt": "écris une fonction pgcd", "code": "def pgcd(a, b):\n    while b:\n        a, b = b, a % b\n    return a"}
+{"prompt": "écris une fonction qui convertit des degrés celsius en fahrenheit", "code": "def celsius_vers_fahrenheit(c):\n    return c * 9 / 5 + 32"}
+{"prompt": "écris une fonction qui lit un fichier texte et retourne ses lignes", "code": "def lire_lignes(chemin):\n    with open(chemin, encoding=\"utf-8\") as f:\n        return f.read().splitlines()"}
+{"prompt": "écris une fonction qui sauvegarde un dictionnaire en json", "code": "import json\n\ndef sauver_json(d, chemin):\n    with open(chemin, \"w\", encoding=\"utf-8\") as f:\n        json.dump(d, f, ensure_ascii=False, indent=2)"}
+{"prompt": "écris une fonction qui aplatit une liste de listes", "code": "def aplatir(listes):\n    return [x for sous_liste in listes for x in sous_liste]"}
+{"prompt": "écris une fonction qui compte la fréquence des mots d'un texte", "code": "from collections import Counter\n\ndef frequence_mots(texte):\n    return Counter(texte.lower().split())"}
+{"prompt": "écris une fonction qui convertit une chaîne binaire en entier", "code": "def binaire_vers_entier(s):\n    return int(s, 2)"}
+{"prompt": "écris un générateur des nombres pairs jusqu'à n", "code": "def pairs(n):\n    for i in range(0, n + 1, 2):\n        yield i"}
+{"prompt": "écris un décorateur qui mesure le temps d'exécution d'une fonction", "code": "import time\nfrom functools import wraps\n\ndef chronometre(fonction):\n    @wraps(fonction)\n    def enveloppe(*args, **kwargs):\n        debut = time.perf_counter()\n        resultat = fonction(*args, **kwargs)\n        duree = time.perf_counter() - debut\n        print(f\"{fonction.__name__}: {duree:.4f}s\")\n        return resultat\n    return enveloppe"}
+{"prompt": "écris une fonction qui trie une liste de dictionnaires par une clé", "code": "def trier_par_cle(items, cle):\n    return sorted(items, key=lambda d: d[cle])"}
+{"prompt": "écris une fonction qui fusionne deux listes en paires", "code": "def en_paires(a, b):\n    return list(zip(a, b))"}
+{"prompt": "écris une fonction produit scalaire de deux vecteurs", "code": "def produit_scalaire(u, v):\n    return sum(x * y for x, y in zip(u, v))"}
+{"prompt": "écris une fonction qui transpose une matrice", "code": "def transposer(matrice):\n    return [list(ligne) for ligne in zip(*matrice)]"}
+{"prompt": "écris une classe Point avec distance à l'origine", "code": "import math\n\nclass Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n\n    def distance_origine(self):\n        return math.hypot(self.x, self.y)"}
+{"prompt": "écris une fonction de tri à bulles", "code": "def tri_bulles(nombres):\n    items = list(nombres)\n    for i in range(len(items)):\n        for j in range(len(items) - 1 - i):\n            if items[j] > items[j + 1]:\n                items[j], items[j + 1] = items[j + 1], items[j]\n    return items"}
+{"prompt": "écris une recherche dichotomique dans une liste triée", "code": "def recherche_dichotomique(items, cible):\n    gauche, droite = 0, len(items) - 1\n    while gauche <= droite:\n        milieu = (gauche + droite) // 2\n        if items[milieu] == cible:\n            return milieu\n        if items[milieu] < cible:\n            gauche = milieu + 1\n        else:\n            droite = milieu - 1\n    return -1"}
+{"prompt": "écris une fonction qui met la première lettre de chaque mot en majuscule", "code": "def capitaliser_mots(s):\n    return \" \".join(mot.capitalize() for mot in s.split())"}
+{"prompt": "écris une fonction qui retourne les n plus grands éléments d'une liste", "code": "import heapq\n\ndef plus_grands(nombres, n):\n    return heapq.nlargest(n, nombres)"}

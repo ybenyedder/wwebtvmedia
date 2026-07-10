@@ -1,0 +1,14 @@
+# Données CIFAR-10 téléchargées
+data/cifar-10-batches-py/
+data/*.tar.gz
+
+# Artefacts d'entraînement
+*.pth
+*.onnx
+*.png
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/

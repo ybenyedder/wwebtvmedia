@@ -1,0 +1,7 @@
+torch>=2.4
+torchvision>=0.19
+numpy
+tqdm
+matplotlib
+onnx
+onnxruntime
