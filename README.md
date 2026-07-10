@@ -15,6 +15,13 @@ machine (GPU recommandé pour les images) :
 
 ## Installation
 
+```bash
+git clone https://github.com/ybenyedder/wwebtvmedia.git
+cd wwebtvmedia
+./setup.sh                 # crée .venv, installe tout, demande la clé + l'URL du LLM
+source .venv/bin/activate
+```
+
 ### Script d'installation (recommandé)
 
 `setup.sh` crée un environnement virtuel, installe toutes les dépendances, puis
