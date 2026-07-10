@@ -5,3 +5,5 @@ tqdm
 matplotlib
 onnx
 onnxruntime
+anthropic>=0.116
+pydantic>=2

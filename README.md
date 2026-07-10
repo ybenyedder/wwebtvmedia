@@ -50,6 +50,40 @@ Le fichier `data/code_pairs.jsonl` fourni (30 exemples) sert uniquement à
 valider la chaîne complète. Remplacez-le par votre propre corpus — des
 milliers de paires minimum pour un début de généralisation.
 
+### Générer les vecteurs automatiquement via un LLM (`generate_dataset.py`)
+
+Plutôt que de rédiger les paires à la main, `generate_dataset.py` les fait
+produire par l'API Claude, en deux phases : Claude génère d'abord des
+**prompts** (énoncés de tâches variés, par catégorie), puis le **code**
+correspondant à chaque prompt. La sortie est écrite dans le fichier lu par
+`main.py` et validée avec son propre `CodePairDataset`.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...          # ou : ant auth login
+python generate_dataset.py --num 300         # ajoute 300 paires à data/code_pairs.jsonl
+python generate_dataset.py --num 40 --language "JavaScript" --output data/js_pairs.jsonl
+python generate_dataset.py --dry-run --num 20   # teste toute la chaîne SANS API ni clé
+python main.py train-code --data data/code_pairs.jsonl   # entraîne sur les vecteurs produits
+```
+
+Points clés :
+
+- **Connecté dynamiquement à `main.py`** : même fichier de sortie (`CODE_DATA`),
+  respect de la contrainte de longueur (`MAX_CODE_LEN`), validation finale via
+  `CodePairDataset`.
+- **Sorties structurées** (schéma Pydantic) : le JSON produit est garanti valide,
+  sans parsing fragile de texte libre.
+- **Reprise et déduplication** : `--append` (défaut) reprend le fichier existant
+  et ignore les prompts déjà présents ; écriture ligne par ligne (un crash
+  conserve le progrès).
+- **Robustesse** : nouvelles tentatives automatiques du SDK sur 429/5xx, un échec
+  de génération n'interrompt pas le lot, les paires trop longues sont écartées
+  (comptées, pas tronquées silencieusement).
+- **`--dry-run`** : générateur factice hors-ligne pour valider la chaîne complète
+  sans clé d'API.
+
+Modèle par défaut : `claude-opus-4-8` (modifiable avec `--model`).
+
 ## Détails techniques
 
 - Tokenisation **byte-level** partagée (aucun vocabulaire à télécharger),
