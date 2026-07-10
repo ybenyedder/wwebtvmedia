@@ -1,29 +1,33 @@
 """
-Génère dynamiquement des vecteurs d'entraînement (prompt, code) via l'API Claude,
+Génère dynamiquement des vecteurs d'entraînement (prompt, code) via un LLM,
 au format JSONL consommé par main.py (data/code_pairs.jsonl).
 
+Deux fournisseurs sont pris en charge (--provider) :
+  - anthropic : API Claude (SDK `anthropic`, sorties structurées natives) ;
+  - deepseek  : API DeepSeek, compatible OpenAI (SDK `openai`, mode JSON).
+
 Deux phases, comme demandé — on fait générer le prompt PUIS le code au LLM :
-  Phase 1  PROMPTS : Claude produit des descriptions de tâches de code variées
-                     (sortie structurée, dédupliquées par catégorie).
-  Phase 2  CODE    : pour chaque prompt, Claude écrit le code correspondant
+  Phase 1  PROMPTS : le modèle produit des descriptions de tâches de code
+                     variées (sortie structurée, dédupliquées par catégorie).
+  Phase 2  CODE    : pour chaque prompt, le modèle écrit le code correspondant
                      (sortie structurée : un seul bloc de code par prompt).
 
 Connexion dynamique à main.py : le script écrit dans le MÊME fichier que
 main.py lit (CODE_DATA), respecte sa contrainte de longueur (MAX_CODE_LEN) et
 valide le résultat final avec son propre chargeur CodePairDataset.
 
-Auth (clé d'API) — résolue par le SDK dans cet ordre :
-  1. variable d'environnement ANTHROPIC_API_KEY (recommandé) ;
-  2. profil créé par `ant auth login` (aucune variable à définir).
+Auth (clés d'API), résolues dans l'environnement :
+  - anthropic : ANTHROPIC_API_KEY (ou profil `ant auth login`) ;
+  - deepseek  : DEEPSEEK_API_KEY.
 Passez --dry-run pour tester toute la chaîne hors-ligne, sans clé ni API.
 
 Exemples :
   export ANTHROPIC_API_KEY=sk-ant-...
-  python generate_dataset.py --num 300
-  python generate_dataset.py --num 40 --language "JavaScript" --output data/js_pairs.jsonl
-  python generate_dataset.py --dry-run --num 20         # hors-ligne, sans API
-  # puis on entraîne le générateur de code sur les vecteurs produits :
-  python main.py train-code --data data/code_pairs.jsonl
+  python generate_dataset.py --num 300                       # Claude (défaut)
+  export DEEPSEEK_API_KEY=sk-...
+  python generate_dataset.py --provider deepseek --num 300   # DeepSeek
+  python generate_dataset.py --dry-run --num 20              # hors-ligne, sans API
+  python main.py train-code --data data/code_pairs.jsonl     # entraîne dessus
 """
 
 import argparse
@@ -45,7 +49,11 @@ except Exception as exc:  # torch/torchvision absents : on reste autonome
     print(f"[i] main.py non importé ({exc.__class__.__name__}) — valeurs par "
           f"défaut utilisées (sortie={DEFAULT_OUTPUT}, max_len={MAX_CODE_LEN}).")
 
-DEFAULT_MODEL = "claude-opus-4-8"
+PROVIDER_DEFAULT_MODEL = {
+    "anthropic": "claude-opus-4-8",
+    "deepseek": "deepseek-chat",
+}
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 # Catégories parcourues en boucle pour forcer la diversité des prompts.
 CATEGORIES = [
@@ -74,10 +82,24 @@ class CodeSolution(BaseModel):
     code: str = Field(description="Le code source seul, sans texte ni ``` autour.")
 
 
-# --- Appel structuré robuste (parse, avec repli sur output_config.format) ---
+def _parse_lenient(text, schema):
+    """Valide `text` contre `schema`, en tolérant les défauts fréquents des
+    LLM : balises ``` autour du JSON et sauts de ligne littéraux dans les
+    chaînes (json.loads(strict=False) les accepte)."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]           # retire ```json ... ```
+        if text.lstrip().startswith("json"):
+            text = text.lstrip()[4:]
+    try:
+        return schema.model_validate_json(text)
+    except Exception:
+        return schema.model_validate(json.loads(text, strict=False))
+
+
 def _strict_schema(schema):
     """Ajoute additionalProperties=false à chaque objet (exigé par les
-    sorties structurées de l'API sur le chemin de repli)."""
+    sorties structurées de type json_schema)."""
     node = schema.model_json_schema()
 
     def walk(n):
@@ -94,33 +116,90 @@ def _strict_schema(schema):
     return node
 
 
-def structured(client, model, system, user, schema, max_tokens):
-    """Retourne une instance validée de `schema` (sous-classe Pydantic)."""
-    try:
-        resp = client.messages.parse(
-            model=model, max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_format=schema,
+# --- Fournisseurs ---
+# Chaque fournisseur expose .structured(system, user, schema, max_tokens) et
+# retourne une instance validée du schéma Pydantic demandé.
+class AnthropicProvider:
+    def __init__(self, model):
+        try:
+            import anthropic
+        except ImportError:
+            sys.exit("Le paquet 'anthropic' est requis : pip install anthropic")
+        if not (os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+            sys.exit(
+                "Aucune clé d'API Anthropic trouvée. Définissez ANTHROPIC_API_KEY "
+                "(export ANTHROPIC_API_KEY=sk-ant-...) ou connectez-vous via "
+                "`ant auth login`. Pour tester sans API : --dry-run.")
+        self.model = model
+        self.client = anthropic.Anthropic(max_retries=4)
+
+    def structured(self, system, user, schema, max_tokens):
+        try:
+            resp = self.client.messages.parse(
+                model=self.model, max_tokens=max_tokens, system=system,
+                messages=[{"role": "user", "content": user}],
+                output_format=schema,
+            )
+            return resp.parsed_output
+        except AttributeError:
+            # SDK plus ancien sans messages.parse : output_config.format
+            resp = self.client.messages.create(
+                model=self.model, max_tokens=max_tokens, system=system,
+                messages=[{"role": "user", "content": user}],
+                output_config={"format": {
+                    "type": "json_schema", "schema": _strict_schema(schema)}},
+            )
+            text = next(b.text for b in resp.content if b.type == "text")
+            return _parse_lenient(text, schema)
+
+
+class DeepSeekProvider:
+    """API DeepSeek, compatible OpenAI. Utilise le mode JSON (response_format
+    json_object) + le schéma injecté dans le prompt, puis valide avec Pydantic.
+    DeepSeek exige que le mot « json » figure dans les messages : le schéma
+    injecté le garantit."""
+
+    def __init__(self, model):
+        try:
+            from openai import OpenAI
+        except ImportError:
+            sys.exit("Le paquet 'openai' est requis pour DeepSeek : "
+                     "pip install openai")
+        key = os.environ.get("DEEPSEEK_API_KEY")
+        if not key:
+            sys.exit(
+                "Aucune clé d'API DeepSeek trouvée. Définissez DEEPSEEK_API_KEY "
+                "(export DEEPSEEK_API_KEY=sk-...). Pour tester sans API : "
+                "--dry-run.")
+        self.model = model
+        self.client = OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL,
+                             max_retries=4)
+
+    def structured(self, system, user, schema, max_tokens):
+        fmt = json.dumps(_strict_schema(schema), ensure_ascii=False)
+        sys_msg = (system + "\n\nRéponds UNIQUEMENT par un objet JSON valide, "
+                   "sans texte autour, respectant strictement ce schéma :\n"
+                   + fmt)
+        resp = self.client.chat.completions.create(
+            model=self.model, max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": sys_msg},
+                      {"role": "user", "content": user}],
         )
-        return resp.parsed_output
-    except AttributeError:
-        # SDK plus ancien sans messages.parse : on passe par output_config.format
-        resp = client.messages.create(
-            model=model, max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"format": {
-                "type": "json_schema",
-                "schema": _strict_schema(schema),
-            }},
-        )
-        text = next(b.text for b in resp.content if b.type == "text")
-        return schema.model_validate_json(text)
+        return _parse_lenient(resp.choices[0].message.content, schema)
+
+
+def make_provider(name, model):
+    if name == "anthropic":
+        return AnthropicProvider(model)
+    if name == "deepseek":
+        return DeepSeekProvider(model)
+    sys.exit(f"Fournisseur inconnu : {name}")
 
 
 # --- Phase 1 : génération des prompts ---
-def generate_prompts(client, model, language, category, count, avoid):
+def generate_prompts(provider, language, category, count, avoid):
     system = (
         "Tu génères des énoncés d'exercices de programmation courts, clairs et "
         "variés, destinés à entraîner un modèle de génération de code. Chaque "
@@ -129,10 +208,8 @@ def generate_prompts(client, model, language, category, count, avoid):
     avoid_block = ""
     if avoid:
         sample = "\n".join(f"- {p}" for p in list(avoid)[-40:])
-        avoid_block = (
-            "\n\nÉvite de répéter ou de reformuler ces énoncés déjà générés :\n"
-            f"{sample}"
-        )
+        avoid_block = ("\n\nÉvite de répéter ou de reformuler ces énoncés déjà "
+                       f"générés :\n{sample}")
     user = (
         f"Langage cible : {language}.\n"
         f"Thème : {category}.\n"
@@ -141,33 +218,29 @@ def generate_prompts(client, model, language, category, count, avoid):
         f"Chaque énoncé doit être court (une phrase) et sans exemple de code."
         f"{avoid_block}"
     )
-    result = structured(client, model, system, user, PromptList, max_tokens=2000)
+    result = provider.structured(system, user, PromptList, max_tokens=2000)
     return [p.strip() for p in result.prompts if p.strip()]
 
 
 # --- Phase 2 : génération du code pour un prompt ---
-def generate_code(client, model, language, prompt):
+def generate_code(provider, language, prompt):
     system = (
         f"Tu es un expert {language}. Tu écris du code correct, idiomatique et "
         f"CONCIS (idéalement moins de 30 lignes). Tu réponds uniquement par le "
         f"code source, sans explication, sans texte, sans balises Markdown."
     )
     user = f"Écris le code {language} pour la tâche suivante :\n{prompt}"
-    result = structured(client, model, system, user, CodeSolution, max_tokens=1200)
+    result = provider.structured(system, user, CodeSolution, max_tokens=1200)
     return result.code.strip()
 
 
 # --- Générateur factice pour --dry-run (aucune API) ---
-def dry_run_prompts(language, category, count, avoid, seed):
-    out = []
-    for i in range(count):
-        n = seed + i
-        out.append(f"écris une fonction {language.lower()} pour {category} "
-                   f"(variante {n})")
-    return out
+def dry_run_prompts(language, category, count, seed):
+    return [f"écris une fonction {language.lower()} pour {category} "
+            f"(variante {seed + i})" for i in range(count)]
 
 
-def dry_run_code(language, prompt, seed):
+def dry_run_code(prompt, seed):
     return (f"def tache_{seed}(x):\n"
             f"    # {prompt[:50]}\n"
             f"    return x")
@@ -198,6 +271,7 @@ def within_budget(prompt, code, max_bytes):
 
 # --- Boucle principale ---
 def run(args):
+    model = args.model or PROVIDER_DEFAULT_MODEL[args.provider]
     max_bytes = args.max_bytes
     seen = set()
     mode = "a" if args.append else "w"
@@ -208,20 +282,10 @@ def run(args):
     elif os.path.exists(args.output):
         print(f"[!] '{args.output}' sera écrasé (--overwrite).")
 
-    client = None
+    provider = None
     if not args.dry_run:
-        try:
-            import anthropic
-        except ImportError:
-            sys.exit("Le paquet 'anthropic' est requis : pip install anthropic")
-        if not (os.environ.get("ANTHROPIC_API_KEY")
-                or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-            sys.exit(
-                "Aucune clé d'API trouvée. Définissez ANTHROPIC_API_KEY "
-                "(export ANTHROPIC_API_KEY=sk-ant-...) ou connectez-vous via "
-                "`ant auth login`. Pour tester sans API : --dry-run.")
-        # max_retries relève le défaut (2) : robustesse face aux 429/5xx.
-        client = anthropic.Anthropic(max_retries=4)
+        provider = make_provider(args.provider, model)
+        print(f"[i] Fournisseur : {args.provider} | modèle : {model}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
@@ -235,10 +299,9 @@ def run(args):
             # Phase 1 : prompts
             try:
                 if args.dry_run:
-                    prompts = dry_run_prompts(args.language, category, need,
-                                              seen, kept)
+                    prompts = dry_run_prompts(args.language, category, need, kept)
                 else:
-                    prompts = generate_prompts(client, args.model, args.language,
+                    prompts = generate_prompts(provider, args.language,
                                                category, need, seen)
             except Exception as exc:
                 print(f"[!] Phase 1 échouée ({category}) : {exc}. On continue.")
@@ -254,10 +317,9 @@ def run(args):
                     continue
                 try:
                     if args.dry_run:
-                        code = dry_run_code(args.language, prompt, kept)
+                        code = dry_run_code(prompt, kept)
                     else:
-                        code = generate_code(client, args.model, args.language,
-                                             prompt)
+                        code = generate_code(provider, args.language, prompt)
                 except Exception as exc:
                     failed += 1
                     print(f"[!] Code échoué pour « {prompt[:50]}... » : {exc}")
@@ -295,14 +357,18 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Génère des vecteurs (prompt, code) via l'API Claude "
-                    "pour entraîner le générateur de code de main.py.")
+        description="Génère des vecteurs (prompt, code) via un LLM (Claude ou "
+                    "DeepSeek) pour entraîner le générateur de code de main.py.")
+    p.add_argument("--provider", choices=list(PROVIDER_DEFAULT_MODEL),
+                   default="anthropic",
+                   help="Fournisseur LLM (défaut : anthropic).")
     p.add_argument("--num", type=int, default=200,
                    help="Nombre de paires à générer (défaut : 200).")
     p.add_argument("--batch-size", type=int, default=15,
                    help="Prompts demandés par appel en phase 1 (défaut : 15).")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"Modèle Claude (défaut : {DEFAULT_MODEL}).")
+    p.add_argument("--model", default=None,
+                   help="Modèle à utiliser (défaut : selon le fournisseur — "
+                        "claude-opus-4-8 / deepseek-chat).")
     p.add_argument("--language", default="Python",
                    help="Langage cible du code généré (défaut : Python).")
     p.add_argument("--output", default=DEFAULT_OUTPUT,

@@ -6,4 +6,5 @@ matplotlib
 onnx
 onnxruntime
 anthropic>=0.116
+openai>=1.40
 pydantic>=2

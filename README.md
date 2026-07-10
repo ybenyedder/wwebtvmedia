@@ -53,14 +53,28 @@ milliers de paires minimum pour un début de généralisation.
 ### Générer les vecteurs automatiquement via un LLM (`generate_dataset.py`)
 
 Plutôt que de rédiger les paires à la main, `generate_dataset.py` les fait
-produire par l'API Claude, en deux phases : Claude génère d'abord des
-**prompts** (énoncés de tâches variés, par catégorie), puis le **code**
-correspondant à chaque prompt. La sortie est écrite dans le fichier lu par
-`main.py` et validée avec son propre `CodePairDataset`.
+produire par un LLM, en deux phases : le modèle génère d'abord des **prompts**
+(énoncés de tâches variés, par catégorie), puis le **code** correspondant à
+chaque prompt. La sortie est écrite dans le fichier lu par `main.py` et validée
+avec son propre `CodePairDataset`.
+
+Deux fournisseurs sont pris en charge via `--provider` :
+
+- **`anthropic`** (défaut) — API Claude, sorties structurées natives.
+  Clé : `ANTHROPIC_API_KEY` (ou `ant auth login`). Modèle : `claude-opus-4-8`.
+- **`deepseek`** — API DeepSeek (compatible OpenAI), mode JSON.
+  Clé : `DEEPSEEK_API_KEY`. Modèle : `deepseek-chat`.
 
 ```bash
+# Claude (défaut)
 export ANTHROPIC_API_KEY=sk-ant-...          # ou : ant auth login
 python generate_dataset.py --num 300         # ajoute 300 paires à data/code_pairs.jsonl
+
+# DeepSeek
+export DEEPSEEK_API_KEY=sk-...
+python generate_dataset.py --provider deepseek --num 300
+
+# Autres options
 python generate_dataset.py --num 40 --language "JavaScript" --output data/js_pairs.jsonl
 python generate_dataset.py --dry-run --num 20   # teste toute la chaîne SANS API ni clé
 python main.py train-code --data data/code_pairs.jsonl   # entraîne sur les vecteurs produits
@@ -68,11 +82,15 @@ python main.py train-code --data data/code_pairs.jsonl   # entraîne sur les vec
 
 Points clés :
 
+- **Deux fournisseurs interchangeables** (Claude, DeepSeek) derrière une seule
+  interface — même format de sortie quel que soit le fournisseur.
+
 - **Connecté dynamiquement à `main.py`** : même fichier de sortie (`CODE_DATA`),
   respect de la contrainte de longueur (`MAX_CODE_LEN`), validation finale via
   `CodePairDataset`.
-- **Sorties structurées** (schéma Pydantic) : le JSON produit est garanti valide,
-  sans parsing fragile de texte libre.
+- **Sorties structurées** (schéma Pydantic) : sorties structurées natives côté
+  Claude, mode JSON côté DeepSeek, avec parsing tolérant (retrait des balises
+  ``` et des sauts de ligne littéraux que certains modèles émettent).
 - **Reprise et déduplication** : `--append` (défaut) reprend le fichier existant
   et ignore les prompts déjà présents ; écriture ligne par ligne (un crash
   conserve le progrès).
@@ -82,7 +100,8 @@ Points clés :
 - **`--dry-run`** : générateur factice hors-ligne pour valider la chaîne complète
   sans clé d'API.
 
-Modèle par défaut : `claude-opus-4-8` (modifiable avec `--model`).
+Modèle par défaut : `claude-opus-4-8` (anthropic) ou `deepseek-chat` (deepseek),
+modifiable avec `--model`.
 
 ## Détails techniques
 
