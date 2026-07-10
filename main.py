@@ -83,6 +83,8 @@ CODE_BATCH = 16
 LR_CODE = 3e-4
 CODE_CKPT = "code_checkpoint.pth"
 CODE_DATA = "data/code_pairs.jsonl"
+ONNX_CODE_PATH = "wwebtvmedia_code_generator.onnx"
+NEG_INF = -1e9              # masque additif ONNX (évite les NaN de -inf)
 
 NUM_WORKERS = min(4, os.cpu_count() or 2)
 
@@ -809,6 +811,247 @@ def generate_code(prompt, temperature=0.8, top_k=40):
     return code
 
 
+# --- EXPORT ONNX DU GÉNÉRATEUR DE CODE (avec cache KV) ---
+class ONNXCodeGenerator(nn.Module):
+    """Graphe ONNX d'un PAS de décodage avec cache clé/valeur.
+
+    Réutilise les poids d'un CodeGenerator entraîné mais recalcule l'attention
+    explicitement (matmul + softmax) — plus robuste à l'export que SDPA avec
+    cache dynamique. Un seul graphe gère l'amorçage (past de longueur 0) et les
+    pas incrémentaux (T=1), grâce à des entrées explicites :
+
+      input_ids     (B, T)              tokens à encoder
+      position_ids  (B, T)              positions absolues correspondantes
+      attn_mask     (B, 1, T, T+P)      masque additif (0 = visible, -1e9 sinon)
+      past_k_i/v_i  (B, H, P, Dh)       cache par couche (P peut valoir 0)
+
+    Sorties : logits (B, T, vocab) et present_k_i/v_i (B, H, P+T, Dh).
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.n_layers = len(model.blocks)
+        self.heads = model.blocks[0].attn.heads
+        self.head_dim = model.blocks[0].attn.head_dim
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, input_ids, position_ids, attn_mask, *pasts):
+        m = self.model
+        B, T = input_ids.shape
+        C = self.heads * self.head_dim
+        h = m.tok(input_ids) + m.pos[0][position_ids]      # (B, T, C)
+
+        presents = []
+        for i, blk in enumerate(m.blocks):
+            x = blk.norm1(h)
+            q, k, v = blk.attn.qkv(x).split(C, dim=2)
+            q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+            k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+            v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+            pk, pv = pasts[2 * i], pasts[2 * i + 1]
+            k = torch.cat([pk, k], dim=2)                  # (B, H, P+T, Dh)
+            v = torch.cat([pv, v], dim=2)
+            presents += [k, v]
+            scores = (q @ k.transpose(-2, -1)) * self.scale   # (B, H, T, P+T)
+            scores = scores + attn_mask
+            a = torch.softmax(scores, dim=-1) @ v          # (B, H, T, Dh)
+            a = a.transpose(1, 2).reshape(B, T, C)
+            h = h + blk.attn.proj(a)
+            h = h + blk.ff(blk.norm2(h))
+
+        logits = m.head(m.norm(h))
+        return (logits, *presents)
+
+
+def _causal_add_mask(seq, total):
+    """Masque additif causal (seq requêtes x total clés). La clé j est visible
+    par la requête i si j <= (total - seq) + i (préfixe déjà en cache inclus)."""
+    import numpy as np
+    past = total - seq
+    qi = np.arange(seq)[:, None] + past
+    kj = np.arange(total)[None, :]
+    m = np.where(kj <= qi, 0.0, NEG_INF).astype(np.float32)
+    return m[None, None]                                   # (1, 1, seq, total)
+
+
+def _load_code_model():
+    if not os.path.exists(CODE_CKPT):
+        raise SystemExit(
+            f"'{CODE_CKPT}' introuvable : lancez d'abord `python main.py train-code`.")
+    model = CodeGenerator().to(DEVICE)
+    model.load_state_dict(torch.load(CODE_CKPT, map_location=DEVICE,
+                                     weights_only=True)["model_state"])
+    return model.eval()
+
+
+def _code_io_names(n_layers):
+    ins = ["input_ids", "position_ids", "attn_mask"]
+    outs = ["logits"]
+    for i in range(n_layers):
+        ins += [f"past_k_{i}", f"past_v_{i}"]
+        outs += [f"present_k_{i}", f"present_v_{i}"]
+    return ins, outs
+
+
+def export_code_onnx():
+    print("\n--- Exportation ONNX du générateur de code (cache KV) ---")
+    model = _load_code_model()
+    wrapper = ONNXCodeGenerator(model).to(DEVICE).eval()
+    H, Dh, L = wrapper.heads, wrapper.head_dim, wrapper.n_layers
+
+    # Trace avec un past NON vide (P=3) et T=1 : la concaténation du cache est
+    # ainsi présente dans le graphe ; les axes dynamiques couvrent P=0 et T>1.
+    P, T = 3, 1
+    dummy_ids = torch.zeros(1, T, dtype=torch.long, device=DEVICE)
+    dummy_pos = torch.full((1, T), P, dtype=torch.long, device=DEVICE)
+    dummy_mask = torch.zeros(1, 1, T, P + T, device=DEVICE)
+    dummy_past = [torch.zeros(1, H, P, Dh, device=DEVICE) for _ in range(2 * L)]
+
+    in_names, out_names = _code_io_names(L)
+    dyn = {"input_ids": {0: "batch", 1: "seq"},
+           "position_ids": {0: "batch", 1: "seq"},
+           "attn_mask": {0: "batch", 2: "seq", 3: "total"},
+           "logits": {0: "batch", 1: "seq"}}
+    for i in range(L):
+        dyn[f"past_k_{i}"] = {0: "batch", 2: "past"}
+        dyn[f"past_v_{i}"] = {0: "batch", 2: "past"}
+        dyn[f"present_k_{i}"] = {0: "batch", 2: "total"}
+        dyn[f"present_v_{i}"] = {0: "batch", 2: "total"}
+
+    torch.onnx.export(
+        wrapper, (dummy_ids, dummy_pos, dummy_mask, *dummy_past), ONNX_CODE_PATH,
+        export_params=True, opset_version=18, do_constant_folding=True,
+        input_names=in_names, output_names=out_names, dynamic_axes=dyn,
+        dynamo=False,
+    )
+    print(f"Modèle ONNX sauvegardé : {ONNX_CODE_PATH}")
+
+    # Vérification : décodage greedy ONNX vs PyTorch (cache KV) sur un prompt.
+    try:
+        toks_pt = _greedy_torch(model, "écris une fonction", 30)
+        toks_ox = _greedy_onnx(ONNX_CODE_PATH, L, H, Dh, "écris une fonction", 30)
+        match = toks_pt == toks_ox
+        print(f"Vérification ONNX vs PyTorch (greedy, {len(toks_pt)} tokens) : "
+              f"{'identiques ✓' if match else 'DIFFÉRENTS ✗'}")
+    except ImportError:
+        print("onnxruntime absent : vérification ONNX ignorée.")
+
+
+@torch.no_grad()
+def _greedy_torch(model, prompt, n):
+    ids = [BOS] + text_to_ids(prompt)[: MAX_CODE_LEN // 2] + [SEP]
+    x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+    logits, caches = model(x, use_cache=True)
+    out = []
+    for _ in range(n):
+        nxt = int(logits[:, -1].argmax())
+        if nxt == EOS:
+            break
+        out.append(nxt)
+        logits, caches = model(torch.tensor([[nxt]], device=DEVICE),
+                               caches=caches, use_cache=True)
+    return out
+
+
+def _greedy_onnx(path, n_layers, heads, head_dim, prompt, n, session=None):
+    import numpy as np
+    import onnxruntime as ort
+    sess = session or ort.InferenceSession(
+        path, providers=["CPUExecutionProvider"])
+    _, out_names = _code_io_names(n_layers)
+
+    ids = [BOS] + text_to_ids(prompt)[: MAX_CODE_LEN // 2] + [SEP]
+    lp = len(ids)
+    past = [np.zeros((1, heads, 0, head_dim), np.float32)
+            for _ in range(2 * n_layers)]
+
+    def step(token_ids, start_pos):
+        t = len(token_ids)
+        total = past[0].shape[2] + t
+        feed = {"input_ids": np.array([token_ids], np.int64),
+                "position_ids": np.array([list(range(start_pos, start_pos + t))],
+                                         np.int64),
+                "attn_mask": _causal_add_mask(t, total)}
+        for i in range(n_layers):
+            feed[f"past_k_{i}"] = past[2 * i]
+            feed[f"past_v_{i}"] = past[2 * i + 1]
+        res = dict(zip(out_names, sess.run(None, feed)))
+        for i in range(n_layers):
+            past[2 * i] = res[f"present_k_{i}"]
+            past[2 * i + 1] = res[f"present_v_{i}"]
+        return res["logits"]
+
+    logits = step(ids, 0)                                  # amorçage
+    out = []
+    for _ in range(n):
+        nxt = int(logits[0, -1].argmax())
+        if nxt == EOS:
+            break
+        out.append(nxt)
+        logits = step([nxt], lp + len(out) - 1)            # pas incrémental
+    return out
+
+
+def generate_code_onnx(prompt, max_new=400, temperature=0.8, top_k=40,
+                       seed=None):
+    """Génère du code via le graphe ONNX + cache KV, sous onnxruntime."""
+    import numpy as np
+    import onnxruntime as ort
+    if not os.path.exists(ONNX_CODE_PATH):
+        raise SystemExit(f"'{ONNX_CODE_PATH}' introuvable : lancez d'abord "
+                         f"`python main.py export-code-onnx`.")
+    sess = ort.InferenceSession(ONNX_CODE_PATH,
+                                providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(seed)
+    # nombre de couches déduit des sorties du graphe
+    n_layers = sum(1 for o in sess.get_outputs() if o.name.startswith("present_k_"))
+    heads = sess.get_outputs()[1].shape[1]
+    head_dim = sess.get_outputs()[1].shape[3]
+    _, out_names = _code_io_names(n_layers)
+
+    ids = [BOS] + text_to_ids(prompt)[: MAX_CODE_LEN // 2] + [SEP]
+    lp = len(ids)
+    past = [np.zeros((1, heads, 0, head_dim), np.float32)
+            for _ in range(2 * n_layers)]
+
+    def step(token_ids, start_pos):
+        t = len(token_ids)
+        total = past[0].shape[2] + t
+        feed = {"input_ids": np.array([token_ids], np.int64),
+                "position_ids": np.array([list(range(start_pos, start_pos + t))],
+                                         np.int64),
+                "attn_mask": _causal_add_mask(t, total)}
+        for i in range(n_layers):
+            feed[f"past_k_{i}"] = past[2 * i]
+            feed[f"past_v_{i}"] = past[2 * i + 1]
+        res = dict(zip(out_names, sess.run(None, feed)))
+        for i in range(n_layers):
+            past[2 * i] = res[f"present_k_{i}"]
+            past[2 * i + 1] = res[f"present_v_{i}"]
+        return res["logits"][0, -1]
+
+    logits = step(ids, 0)
+    generated = []
+    for _ in range(max_new):
+        if lp + len(generated) >= MAX_CODE_LEN:
+            break
+        step_logits = logits / max(temperature, 1e-5)
+        if top_k > 0:
+            kth = np.partition(step_logits, -top_k)[-top_k]
+            step_logits = np.where(step_logits < kth, -np.inf, step_logits)
+        probs = np.exp(step_logits - step_logits.max())
+        probs /= probs.sum()
+        nxt = int(rng.choice(len(probs), p=probs))
+        if nxt == EOS:
+            break
+        generated.append(nxt)
+        logits = step([nxt], lp + len(generated) - 1)
+    code = ids_to_text(generated)
+    print(f"# Prompt : {prompt}  (ONNX + cache KV)\n{'-' * 60}\n{code}")
+    return code
+
+
 # --- CLI ---
 def main():
     parser = argparse.ArgumentParser(
@@ -837,6 +1080,15 @@ def main():
     p.add_argument("--top-k", type=int, default=40)
 
     sub.add_parser("export-onnx", help="Exporte le générateur d'images en ONNX")
+    sub.add_parser("export-code-onnx",
+                   help="Exporte le générateur de code en ONNX (cache KV)")
+
+    p = sub.add_parser("generate-code-onnx",
+                       help="Génère du code via le graphe ONNX + cache KV")
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--top-k", type=int, default=40)
+    p.add_argument("--seed", type=int, default=None)
 
     args = parser.parse_args()
     if args.cmd == "train-image":
@@ -849,6 +1101,11 @@ def main():
         generate_code(args.prompt, args.temperature, args.top_k)
     elif args.cmd == "export-onnx":
         export_onnx()
+    elif args.cmd == "export-code-onnx":
+        export_code_onnx()
+    elif args.cmd == "generate-code-onnx":
+        generate_code_onnx(args.prompt, temperature=args.temperature,
+                           top_k=args.top_k, seed=args.seed)
     else:
         parser.print_help()
 

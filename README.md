@@ -35,7 +35,11 @@ python main.py generate-image --prompt "une photo de chat" --prompt "un camion"
 python main.py generate-code  --prompt "écris une fonction fibonacci"
 
 # Ré-export ONNX seul (après entraînement)
-python main.py export-onnx
+python main.py export-onnx           # générateur d'images
+python main.py export-code-onnx      # générateur de code (avec cache KV)
+
+# Génération de code via le graphe ONNX + cache KV (sous onnxruntime)
+python main.py generate-code-onnx --prompt "écris une fonction fibonacci" --seed 0
 ```
 
 ## Données d'entraînement du générateur de code
@@ -114,6 +118,14 @@ modifiable avec `--model`.
   `sample_code` amorce le cache une fois sur le prompt puis n'encode que le
   nouveau token à chaque pas — décodage en O(n) au lieu de O(n²). L'équivalence
   exacte avec le recalcul complet (écart ~1e-6) est vérifiée par les tests.
+- **Export ONNX du générateur de code avec cache KV** (`export-code-onnx`) : le
+  graphe est un *pas de décodage* qui expose le cache en entrées (`past_k/v_i`)
+  et sorties (`present_k/v_i`) par couche, avec `input_ids`, `position_ids` et
+  un masque additif. Un seul graphe gère l'amorçage (past de longueur 0) et les
+  pas incrémentaux (une seule position), grâce aux axes dynamiques. L'attention
+  est recalculée explicitement (matmul + softmax) pour un export robuste. La
+  génération sous onnxruntime (`generate-code-onnx`) est vérifiée **identique**
+  au décodage PyTorch en greedy.
 - Les latents sont **normalisés par canal** (statistiques stockées dans le
   checkpoint) avant le flow matching, pour partir d'un bruit N(0,1) cohérent.
 - **EMA** (decay 0,999) sur le réseau de drift, utilisée pour l'export et la
