@@ -15,9 +15,48 @@ machine (GPU recommandé pour les images) :
 
 ## Installation
 
+### Script d'installation (recommandé)
+
+`setup.sh` crée un environnement virtuel, installe toutes les dépendances, puis
+demande la **clé d'API** et l'**URL** du LLM et les enregistre dans un fichier
+`.env` :
+
 ```bash
-pip install -r requirements.txt
+./setup.sh
+source .venv/bin/activate
 ```
+
+Le script demande le fournisseur (`anthropic` ou `deepseek`), la clé d'API et
+l'URL de base, et écrit `.env` (permissions `600`, ignoré par git). Options :
+
+```bash
+WWEBTV_SYSTEM_SITE=1 ./setup.sh   # réutilise les paquets système (ex. torch déjà installé)
+WWEBTV_VENV=env ./setup.sh        # nom de l'environnement virtuel
+```
+
+### Installation manuelle
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env               # puis renseignez la clé et l'URL du LLM
+```
+
+### Configuration du LLM (`.env`)
+
+Les scripts qui appellent un LLM (`generate_dataset.py`, `svg_fit.py
+--from-llm-svg`) chargent `.env` **automatiquement** au démarrage. Variables
+reconnues :
+
+| Variable | Rôle |
+|---|---|
+| `LLM_PROVIDER` | fournisseur par défaut : `anthropic` ou `deepseek` |
+| `ANTHROPIC_API_KEY` | clé d'API Claude |
+| `ANTHROPIC_BASE_URL` | URL de base Claude (optionnelle) |
+| `DEEPSEEK_API_KEY` | clé d'API DeepSeek |
+| `DEEPSEEK_BASE_URL` | URL de base DeepSeek (défaut `https://api.deepseek.com`) |
+
+Voir `.env.example` pour un modèle prêt à copier.
 
 ## Utilisation
 

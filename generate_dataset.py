@@ -37,6 +37,28 @@ import sys
 
 from pydantic import BaseModel, Field
 
+
+def load_dotenv(path=".env"):
+    """Charge les paires KEY=VALUE d'un fichier .env dans l'environnement
+    (sans écraser les variables déjà définies). Cherche .env dans le dossier
+    courant puis à côté de ce script. Aucun paquet externe requis."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (path, os.path.join(here, path)):
+        if not os.path.exists(candidate):
+            continue
+        with open(candidate, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+        return candidate
+    return None
+
+
+load_dotenv()  # clé d'API + URL du LLM depuis .env, si présent
+
 # --- Connexion dynamique à main.py (sans forcer l'import de torch) ---
 DEFAULT_OUTPUT = "data/code_pairs.jsonl"
 MAX_CODE_LEN = 512          # valeur de repli si main.py n'est pas importable
@@ -173,8 +195,8 @@ class DeepSeekProvider:
                 "(export DEEPSEEK_API_KEY=sk-...). Pour tester sans API : "
                 "--dry-run.")
         self.model = model
-        self.client = OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL,
-                             max_retries=4)
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL)
+        self.client = OpenAI(api_key=key, base_url=base_url, max_retries=4)
 
     def structured(self, system, user, schema, max_tokens):
         fmt = json.dumps(_strict_schema(schema), ensure_ascii=False)
@@ -359,9 +381,13 @@ def main():
     p = argparse.ArgumentParser(
         description="Génère des vecteurs (prompt, code) via un LLM (Claude ou "
                     "DeepSeek) pour entraîner le générateur de code de main.py.")
+    env_provider = os.environ.get("LLM_PROVIDER", "anthropic")
+    if env_provider not in PROVIDER_DEFAULT_MODEL:
+        env_provider = "anthropic"
     p.add_argument("--provider", choices=list(PROVIDER_DEFAULT_MODEL),
-                   default="anthropic",
-                   help="Fournisseur LLM (défaut : anthropic).")
+                   default=env_provider,
+                   help=f"Fournisseur LLM (défaut : {env_provider}, "
+                        f"depuis LLM_PROVIDER/.env).")
     p.add_argument("--num", type=int, default=200,
                    help="Nombre de paires à générer (défaut : 200).")
     p.add_argument("--batch-size", type=int, default=15,
