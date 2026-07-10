@@ -109,6 +109,11 @@ modifiable avec `--model`.
   tokens spéciaux `PAD/BOS/SEP/EOS`.
 - L'encodeur de texte (transformer 2 couches) est entraîné conjointement avec
   le VAE en phase 1, puis gelé pour la phase 2.
+- Le générateur de code est un transformer décodeur maison avec **cache KV** :
+  au lieu de recalculer l'attention sur tout le préfixe à chaque token,
+  `sample_code` amorce le cache une fois sur le prompt puis n'encode que le
+  nouveau token à chaque pas — décodage en O(n) au lieu de O(n²). L'équivalence
+  exacte avec le recalcul complet (écart ~1e-6) est vérifiée par les tests.
 - Les latents sont **normalisés par canal** (statistiques stockées dans le
   checkpoint) avant le flow matching, pour partir d'un bruit N(0,1) cohérent.
 - **EMA** (decay 0,999) sur le réseau de drift, utilisée pour l'export et la

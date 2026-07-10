@@ -565,8 +565,79 @@ def generate_images(prompts, n_per_prompt=8, out_path=SAMPLES_PATH):
 
 
 # --- GÉNÉRATEUR DE CODE ---
+class CausalSelfAttention(nn.Module):
+    """Attention multi-têtes causale avec cache clé/valeur optionnel.
+
+    - `past_kv` : (k, v) accumulés des positions précédentes ; concaténés aux
+      k/v courants pour un décodage incrémental.
+    - `use_cache` : renvoie le nouveau (k, v) à réutiliser à l'étape suivante.
+    - `attn_mask` : masque booléen (True = participe) pour le passage complet
+      d'entraînement (causal + masque de padding sur les clés).
+    """
+
+    def __init__(self, dim, heads, dropout=0.1):
+        super().__init__()
+        assert dim % heads == 0
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.dropout = dropout
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        if past_kv is not None:
+            pk, pv = past_kv
+            k = torch.cat([pk, k], dim=2)
+            v = torch.cat([pv, v], dim=2)
+        new_kv = (k, v) if use_cache else None
+        p = self.dropout if self.training else 0.0
+        if attn_mask is not None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                 dropout_p=p)
+        else:
+            # Décodage incrémental (T=1) : la requête voit toutes les clés du
+            # cache, ce qui est causal par construction — aucun masque requis.
+            is_causal = past_kv is None and T > 1
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal,
+                                                 dropout_p=p)
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.proj(out), new_kv
+
+
+class DecoderBlock(nn.Module):
+    """Bloc décodeur pré-norm : attention causale + feed-forward."""
+
+    def __init__(self, dim, heads, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = CausalSelfAttention(dim, heads, dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
+                                nn.Linear(dim * 4, dim))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
+        a, new_kv = self.attn(self.norm1(x), attn_mask, past_kv, use_cache)
+        x = x + self.drop(a)
+        x = x + self.drop(self.ff(self.norm2(x)))
+        return x, new_kv
+
+
 class CodeGenerator(nn.Module):
-    """Transformer décodeur byte-level : prompt -> code (autorégressif)."""
+    """Transformer décodeur byte-level : prompt -> code (autorégressif).
+
+    forward(ids)                       -> logits            (entraînement)
+    forward(ids, use_cache=True)       -> logits, caches    (amorçage du cache)
+    forward(ids, caches=..., use_cache=True) -> logits, caches  (pas incrémental)
+
+    Le cache clé/valeur évite de recalculer l'attention sur tout le préfixe à
+    chaque token généré : le décodage passe de O(n²) à O(n).
+    """
 
     def __init__(self, vocab=VOCAB_SIZE, dim=CODE_DIM, heads=CODE_HEADS,
                  layers=CODE_LAYERS, max_len=MAX_CODE_LEN):
@@ -574,20 +645,37 @@ class CodeGenerator(nn.Module):
         self.max_len = max_len
         self.tok = nn.Embedding(vocab, dim, padding_idx=PAD)
         self.pos = nn.Parameter(torch.zeros(1, max_len, dim))
-        layer = nn.TransformerEncoderLayer(
-            dim, heads, dim * 4, dropout=0.1, batch_first=True, norm_first=True)
-        self.blocks = nn.TransformerEncoder(layer, layers,
-                                            enable_nested_tensor=False)
+        self.blocks = nn.ModuleList(
+            [DecoderBlock(dim, heads) for _ in range(layers)])
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, vocab)
 
-    def forward(self, ids):
-        L = ids.size(1)
-        causal = torch.triu(
-            torch.ones(L, L, dtype=torch.bool, device=ids.device), diagonal=1)
-        h = self.tok(ids) + self.pos[:, :L]
-        h = self.blocks(h, mask=causal, src_key_padding_mask=(ids == PAD))
-        return self.head(self.norm(h))
+    def forward(self, ids, caches=None, use_cache=False):
+        B, T = ids.shape
+        past_len = 0 if caches is None else caches[0][0].size(2)
+        positions = torch.arange(past_len, past_len + T, device=ids.device)
+        h = self.tok(ids) + self.pos[:, positions]
+
+        attn_mask = None
+        if caches is None and T > 1:
+            # Passage complet : causal ET masque de padding sur les clés
+            # (comme src_key_padding_mask) — les requêtes de padding ne sont
+            # pas masquées, ce qui évite des lignes entièrement masquées (NaN).
+            causal = torch.tril(
+                torch.ones(T, T, dtype=torch.bool, device=ids.device))
+            key_ok = (ids != PAD)[:, None, None, :]      # (B,1,1,T)
+            attn_mask = causal[None, None] & key_ok      # (B,1,T,T)
+
+        new_caches = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            past = None if caches is None else caches[i]
+            h, kv = block(h, attn_mask=attn_mask, past_kv=past,
+                          use_cache=use_cache)
+            if use_cache:
+                new_caches.append(kv)
+
+        logits = self.head(self.norm(h))
+        return (logits, new_caches) if use_cache else logits
 
 
 class CodePairDataset(Dataset):
@@ -684,21 +772,29 @@ def train_code(data_path=CODE_DATA, epochs=CODE_EPOCHS, batch_size=CODE_BATCH,
 
 @torch.no_grad()
 def sample_code(model, prompt, max_new=400, temperature=0.8, top_k=40):
+    """Décodage autorégressif avec cache KV : le préfixe (prompt) n'est encodé
+    qu'une fois, puis chaque token n'attend que les clés/valeurs en cache."""
     model.eval()
     ids = [BOS] + text_to_ids(prompt)[: MAX_CODE_LEN // 2] + [SEP]
     x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+
+    # Amorçage : un seul passage sur tout le prompt, on remplit le cache.
+    logits, caches = model(x, use_cache=True)
+    generated = []
     for _ in range(max_new):
-        if x.size(1) >= model.max_len:
+        if len(ids) + len(generated) >= model.max_len:
             break
-        logits = model(x)[0, -1] / max(temperature, 1e-5)
+        step = logits[:, -1] / max(temperature, 1e-5)      # (1, vocab)
         if top_k > 0:
-            kth = torch.topk(logits, min(top_k, logits.size(-1))).values[-1]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-        next_id = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            kth = torch.topk(step, min(top_k, step.size(-1))).values[..., -1:]
+            step = step.masked_fill(step < kth, float("-inf"))
+        next_id = torch.multinomial(F.softmax(step, dim=-1), 1)  # (1, 1)
         if next_id.item() == EOS:
             break
-        x = torch.cat([x, next_id.view(1, 1)], dim=1)
-    return ids_to_text(x[0, len(ids):].tolist())
+        generated.append(next_id.item())
+        # Pas incrémental : on ne passe QUE le nouveau token + le cache.
+        logits, caches = model(next_id, caches=caches, use_cache=True)
+    return ids_to_text(generated)
 
 
 def generate_code(prompt, temperature=0.8, top_k=40):
